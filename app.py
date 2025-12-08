@@ -12,12 +12,12 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 
 # Download blank PBIX once (Microsoft's official blank file)
-BLANK_PBIX = "blank.pbix"
-if not os.path.exists(BLANK_PBIX):
-    urllib.request.urlretrieve(
-        "https://github.com/microsoft/powerbi-desktop-samples/raw/main/Blank%20Report/Blank%20Report.pbix",
-        BLANK_PBIX
-    )
+#BLANK_PBIX = "blank.pbix"
+#if not os.path.exists(BLANK_PBIX):
+   # urllib.request.urlretrieve(
+       # "https://github.com/microsoft/powerbi-desktop-samples/raw/main/Blank%20Report/Blank%20Report.pbix",
+       # BLANK_PBIX
+   # )
 
 @app.route('/generate', methods=['POST'])
 def generate_pbix():

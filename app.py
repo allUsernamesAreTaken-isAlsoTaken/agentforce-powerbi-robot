@@ -63,119 +63,142 @@ def create_blank_pbix(filename):
 
 @app.route('/generate', methods=['POST'])
 def generate_pbix():
-    query = request.json.get('query', 'Tesla last 30 days')
-   
-    # Simple parser for ticker
-    ticker = 'TSLA'
-    if 'apple' in query.lower(): ticker = 'AAPL'
-    elif 'bitcoin' in query.lower(): ticker = 'BTC-USD'
-    elif 'ethereum' in query.lower(): ticker = 'ETH-USD'
-    elif 'spy' in query.lower(): ticker = 'SPY'
-   
-    # Fetch real financial data (free, no key)
-    df = yf.download(ticker, period='30d', interval='1d')
-    df = df.reset_index()
-    df['Ticker'] = ticker
-    df['Change%'] = df['Close'].pct_change() * 100
-    df['Volatility'] = df['Change%'].rolling(window=5).std()
-    df['IsAnomaly'] = df['Change%'].abs() > df['Change%'].std() * 2
-    df = df.dropna()
-   
-    # Narrative insight
-    anomaly_count = df['IsAnomaly'].sum()
-    narrative = f"{ticker} had {anomaly_count} anomalies in 30 days. Confidence: 95%. Max change: {df['Change%'].max():.2f}%."
-   
-    # DAX measures
-    dax_measures = [
-        {"name": "Avg Close", "expression": "AVERAGE(Finance[Close])"},
-        {"name": "30 Day Return", "expression": "DIVIDE([Total Close] - CALCULATE([Total Close], FIRSTDATE(Finance[Date])), CALCULATE([Total Close], FIRSTDATE(Finance[Date])))"},
-        {"name": "Volatility", "expression": "STDEV.S(Finance[Change%])"},
-        {"name": "Anomaly Count", "expression": "COUNTROWS(FILTER(Finance, Finance[IsAnomaly] = TRUE))"}
-    ]
-   
-    # Create blank PBIX
-    blank_pbix = "blank.pbix"
-    create_blank_pbix(blank_pbix)
-   
-    # Unzip blank PBIX
-    extract_dir = "pbix_extracted"
-    shutil.rmtree(extract_dir, ignore_errors=True)
-    with zipfile.ZipFile(blank_pbix, 'r') as zin:
-        zin.extractall(extract_dir)
-   
-    # Create model file (inject data + DAX)
-    model = {
-        "name": "Model",
-        "tables": [{
-            "name": "Finance",
-            "columns": [
-                {"name": "Date", "dataType": "dateTime"},
-                {"name": "Open", "dataType": "double"},
-                {"name": "High", "dataType": "double"},
-                {"name": "Low", "dataType": "double"},
-                {"name": "Close", "dataType": "double"},
-                {"name": "Volume", "dataType": "double"},
-                {"name": "Change%", "dataType": "double"},
-                {"name": "Volatility", "dataType": "double"},
-                {"name": "IsAnomaly", "dataType": "boolean"},
-                {"name": "Ticker", "dataType": "string"}
-            ],
-            "rows": df.to_dict(orient="records")
-        }],
-        "measures": dax_measures,
-        "relationships": [{"fromTable": "Finance", "toTable": "DateDim", "fromColumn": "Date", "toColumn": "Date"}] # Simple star
-    }
-    # Write to a model file (Power BI uses .json-like for schema)
-    with open(os.path.join(extract_dir, "DataModelSchema"), 'w') as f:
-        json.dump(model, f, default=str)
-   
-    # Create report layout (2 pages)
-    report_config = {
-        "sections": [
-            {
-                "name": "Overview",
-                "visualContainers": [
-                    {"type": "candlestick", "config": {"x": "Date", "open": "Open", "high": "High", "low": "Low", "close": "Close"}},
-                    {"type": "bar", "config": {"x": "Date", "y": "Volume"}},
-                    {"type": "card", "config": {"value": "30 Day Return"}},
-                    {"type": "card", "config": {"value": "Volatility"}},
-                    {"type": "card", "config": {"value": "Anomaly Count"}}
-                ]
-            },
-            {
-                "name": "Anomalies",
-                "visualContainers": [
-                    {"type": "line", "config": {"x": "Date", "y": "Change%", "color": "IsAnomaly"}},
-                    {"type": "text", "config": {"text": narrative}}
-                ]
-            }
+    try:
+        query = request.json.get('query', 'Tesla last 30 days')
+    
+        # Simple parser for ticker
+        ticker = 'TSLA'
+        if 'apple' in query.lower(): ticker = 'AAPL'
+        elif 'bitcoin' in query.lower(): ticker = 'BTC-USD'
+        elif 'ethereum' in query.lower(): ticker = 'ETH-USD'
+        elif 'spy' in query.lower(): ticker = 'SPY'
+    
+        # Fetch real financial data (free, no key)
+        df = yf.download(ticker, period='30d', interval='1d')
+        
+        # --- FIX START: Handle MultiIndex columns from yfinance ---
+        if isinstance(df.columns, pd.MultiIndex):
+            # This flattens columns from ('Close', 'AAPL') to just 'Close'
+            df.columns = df.columns.get_level_values(0)
+        # --- FIX END ---
+
+        df = df.reset_index()
+        df['Ticker'] = ticker
+        
+        # Ensure we have numeric data before calculating
+        if 'Close' not in df.columns:
+            return jsonify({"error": "Could not fetch data for this ticker"}), 400
+
+        df['Change%'] = df['Close'].pct_change() * 100
+        df['Volatility'] = df['Change%'].rolling(window=5).std()
+        df['IsAnomaly'] = df['Change%'].abs() > df['Change%'].std() * 2
+        df = df.dropna()
+    
+        # Narrative insight
+        anomaly_count = int(df['IsAnomaly'].sum())
+        max_change = df['Change%'].max()
+        narrative = f"{ticker} had {anomaly_count} anomalies in 30 days. Confidence: 95%. Max change: {max_change:.2f}%."
+    
+        # DAX measures
+        dax_measures = [
+            {"name": "Avg Close", "expression": "AVERAGE(Finance[Close])"},
+            {"name": "30 Day Return", "expression": "DIVIDE([Total Close] - CALCULATE([Total Close], FIRSTDATE(Finance[Date])), CALCULATE([Total Close], FIRSTDATE(Finance[Date])))"},
+            {"name": "Volatility", "expression": "STDEV.S(Finance[Change%])"},
+            {"name": "Anomaly Count", "expression": "COUNTROWS(FILTER(Finance, Finance[IsAnomaly] = TRUE))"}
         ]
-    }
-    os.makedirs(os.path.join(extract_dir, "Report"), exist_ok=True)
-    with open(os.path.join(extract_dir, "Report/Layout"), 'w') as f:
-        json.dump(report_config, f)
-   
-    # Theme (professional dark)
-    theme = {"dataColors": ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"], "background": "#000000", "foreground": "#ffffff"}
-    with open(os.path.join(extract_dir, "Report/Theme"), 'w') as f:
-        json.dump(theme, f)
-   
-    # Re-zip to .pbix
-    output_pbix = f"{ticker}_dashboard.pbix"
-    with zipfile.ZipFile(output_pbix, 'w', zipfile.ZIP_DEFLATED) as zout:
-        for root, _, files in os.walk(extract_dir):
-            for file in files:
-                zout.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), extract_dir))
-   
-    shutil.rmtree(extract_dir)
-    os.remove(blank_pbix)
-   
-    # Base64 for download
-    with open(output_pbix, "rb") as f:
-        pbix_b64 = base64.b64encode(f.read()).decode('utf-8')
-    os.remove(output_pbix)
-   
-    return jsonify({"pbix_base64": pbix_b64, "narrative": narrative, "status": "success"})
+    
+        # Create blank PBIX
+        blank_pbix = "blank.pbix"
+        create_blank_pbix(blank_pbix)
+    
+        # Unzip blank PBIX
+        extract_dir = "pbix_extracted"
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        with zipfile.ZipFile(blank_pbix, 'r') as zin:
+            zin.extractall(extract_dir)
+    
+        # Create model file (inject data + DAX)
+        model = {
+            "name": "Model",
+            "tables": [{
+                "name": "Finance",
+                "columns": [
+                    {"name": "Date", "dataType": "dateTime"},
+                    {"name": "Open", "dataType": "double"},
+                    {"name": "High", "dataType": "double"},
+                    {"name": "Low", "dataType": "double"},
+                    {"name": "Close", "dataType": "double"},
+                    {"name": "Volume", "dataType": "double"},
+                    {"name": "Change%", "dataType": "double"},
+                    {"name": "Volatility", "dataType": "double"},
+                    {"name": "IsAnomaly", "dataType": "boolean"},
+                    {"name": "Ticker", "dataType": "string"}
+                ],
+                "rows": df.to_dict(orient="records")
+            }],
+            "measures": dax_measures,
+            "relationships": [{"fromTable": "Finance", "toTable": "DateDim", "fromColumn": "Date", "toColumn": "Date"}] # Simple star
+        }
+        
+        # Write to a model file (Power BI uses .json-like for schema)
+        with open(os.path.join(extract_dir, "DataModelSchema"), 'w') as f:
+            json.dump(model, f, default=str)
+    
+        # Create report layout (2 pages)
+        report_config = {
+            "sections": [
+                {
+                    "name": "Overview",
+                    "visualContainers": [
+                        {"type": "candlestick", "config": {"x": "Date", "open": "Open", "high": "High", "low": "Low", "close": "Close"}},
+                        {"type": "bar", "config": {"x": "Date", "y": "Volume"}},
+                        {"type": "card", "config": {"value": "30 Day Return"}},
+                        {"type": "card", "config": {"value": "Volatility"}},
+                        {"type": "card", "config": {"value": "Anomaly Count"}}
+                    ]
+                },
+                {
+                    "name": "Anomalies",
+                    "visualContainers": [
+                        {"type": "line", "config": {"x": "Date", "y": "Change%", "color": "IsAnomaly"}},
+                        {"type": "text", "config": {"text": narrative}}
+                    ]
+                }
+            ]
+        }
+        os.makedirs(os.path.join(extract_dir, "Report"), exist_ok=True)
+        with open(os.path.join(extract_dir, "Report/Layout"), 'w') as f:
+            json.dump(report_config, f)
+    
+        # Theme (professional dark)
+        theme = {"dataColors": ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"], "background": "#000000", "foreground": "#ffffff"}
+        with open(os.path.join(extract_dir, "Report/Theme"), 'w') as f:
+            json.dump(theme, f)
+    
+        # Re-zip to .pbix
+        output_pbix = f"{ticker}_dashboard.pbix"
+        with zipfile.ZipFile(output_pbix, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for root, _, files in os.walk(extract_dir):
+                for file in files:
+                    zout.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), extract_dir))
+    
+        shutil.rmtree(extract_dir)
+        if os.path.exists(blank_pbix):
+            os.remove(blank_pbix)
+    
+        # Base64 for download
+        with open(output_pbix, "rb") as f:
+            pbix_b64 = base64.b64encode(f.read()).decode('utf-8')
+        
+        if os.path.exists(output_pbix):
+            os.remove(output_pbix)
+    
+        return jsonify({"pbix_base64": pbix_b64, "narrative": narrative, "status": "success"})
+        
+    except Exception as e:
+        print(f"ERROR: {str(e)}")
+        # Return error as JSON so frontend doesn't show '<' token error
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 # Simple frontend website for demo
 @app.route('/', methods=['GET'])
@@ -201,7 +224,8 @@ def home():
     <h1>🚀 Power BI Dashboard Generator</h1>
     <p>Enter a stock query (e.g., "Apple last 30 days") and click Generate. Your .pbix downloads instantly!</p>
     <input type="text" id="query" placeholder="Enter query..." value="Apple last 30 days">
-    <br>
+    
+
     <button onclick="generateDashboard()">Generate Dashboard</button>
     <div id="status"></div>
     <div id="error"></div>
@@ -223,24 +247,36 @@ def home():
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ query: query })
                 });
-                const data = await response.json();
-                if (data.status === 'success') {
-                    status.innerHTML = 'Dashboard ready! 🎉';
-                    // Decode base64 and create download
-                    const binaryString = atob(data.pbix_base64);
-                    const bytes = new Uint8Array(binaryString.length);
-                    for (let i = 0; i < binaryString.length; i++) {
-                        bytes[i] = binaryString.charCodeAt(i);
+                
+                // Check if response is JSON, otherwise handle HTML errors
+                const contentType = response.headers.get("content-type");
+                if (contentType && contentType.indexOf("application/json") !== -1) {
+                    const data = await response.json();
+                    if (data.status === 'success') {
+                        status.innerHTML = 'Dashboard ready! 🎉';
+                        // Decode base64 and create download
+                        const binaryString = atob(data.pbix_base64);
+                        const bytes = new Uint8Array(binaryString.length);
+                        for (let i = 0; i < binaryString.length; i++) {
+                            bytes[i] = binaryString.charCodeAt(i);
+                        }
+                        const blob = new Blob([bytes], { type: 'application/octet-stream' });
+                        const url = URL.createObjectURL(blob);
+                        download.href = url;
+                        download.download = query.replace(/[^a-z0-9]/gi, '_').toLowerCase() + '_dashboard.pbix';
+                        download.style.display = 'inline';
+                    } else {
+                        status.innerHTML = '';
+                        error.innerHTML = 'Error: ' + (data.error || 'Unknown');
                     }
-                    const blob = new Blob([bytes], { type: 'application/octet-stream' });
-                    const url = URL.createObjectURL(blob);
-                    download.href = url;
-                    download.download = query.replace(/[^a-z0-9]/gi, '_').toLowerCase() + '_dashboard.pbix';
-                    download.style.display = 'inline';
                 } else {
-                    error.innerHTML = 'Error: ' + (data.error || 'Unknown');
+                    const text = await response.text();
+                    status.innerHTML = '';
+                    error.innerHTML = 'Server Error (Check Logs)';
+                    console.error('Non-JSON response:', text);
                 }
             } catch (err) {
+                status.innerHTML = '';
                 error.innerHTML = 'Error: ' + err.message;
             }
         }

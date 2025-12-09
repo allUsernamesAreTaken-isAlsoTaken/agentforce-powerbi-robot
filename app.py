@@ -13,7 +13,7 @@ app = Flask(__name__)
 BLANK_PBIX = "blank.pbix"
 if not os.path.exists(BLANK_PBIX):
     urllib.request.urlretrieve(
-        "https://github.com/microsoft/powerbi-desktop-samples/raw/main/Blank%20Report/Blank%20Report.pbix",
+        "https://github.com/microsoft/powerbi-desktop-samples/raw/main/Sample%20Reports/Blank%20Report.pbix",
         BLANK_PBIX
     )
 @app.route('/generate', methods=['POST'])

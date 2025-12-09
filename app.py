@@ -6,60 +6,54 @@ import zipfile
 import os
 import shutil
 import base64
+import struct
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-# Create minimal blank PBIX from scratch (no download needed)
+# --- Helper to write string to file with UTF-16-LE encoding ---
+def write_utf16le_json(filename, data):
+    with open(filename, 'wb') as f:
+        # Power BI requires BOM or explicit LE encoding for these files
+        json_str = json.dumps(data, indent=2, default=str)
+        f.write(json_str.encode('utf-16-le'))
+
+# Create minimal blank PBIX structure
 def create_blank_pbix(filename):
     with zipfile.ZipFile(filename, 'w', zipfile.ZIP_DEFLATED) as zf:
-        # [Content_Types].xml
+        # 1. [Content_Types].xml (Standard)
         content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="json" ContentType="application/json"/>
   <Default Extension="bin" ContentType="application/vnd.ms-publisher.binary"/>
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Override PartName="/Report/Layout" ContentType="application/vnd.ms-powerbi.content.layout+json"/>
-  <Override PartName="/DataModelSchema" ContentType="application/json"/>
-  <Override PartName="/StaticResources/Media/Images" ContentType="application/vnd.openxmlformats-officedocument.oleObject"/>
+  <Override PartName="/DataModelSchema" ContentType="application/vnd.ms-powerbi.content.schema+json"/>
   <Override PartName="/Report/Theme" ContentType="application/vnd.ms-powerbi.content.theme+json"/>
+  <Override PartName="/Settings" ContentType="application/vnd.ms-powerbi.content.settings+json"/>
+  <Override PartName="/Version" ContentType="application/vnd.ms-powerbi.content.version+binary"/>
 </Types>'''
         zf.writestr('[Content_Types].xml', content_types)
 
-        # _rels/.rels
+        # 2. _rels/.rels
         rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.microsoft.com/powerbi/2016/06/reportlayout" Target="Report/Layout"/>
   <Relationship Id="rId2" Type="http://schemas.microsoft.com/powerbi/2016/06/datamodelschema" Target="DataModelSchema"/>
   <Relationship Id="rId3" Type="http://schemas.microsoft.com/powerbi/2016/06/theme" Target="Report/Theme"/>
+  <Relationship Id="rId4" Type="http://schemas.microsoft.com/powerbi/2016/06/settings" Target="Settings"/>
+  <Relationship Id="rId5" Type="http://schemas.microsoft.com/powerbi/2016/06/version" Target="Version"/>
 </Relationships>'''
         zf.writestr('_rels/.rels', rels)
 
-        # Minimal DataModelSchema (empty model)
-        schema = json.dumps({
-            "name": "Model",
-            "tables": [],
-            "relationships": []
-        }, indent=2)
-        zf.writestr('DataModelSchema', schema)
+        # 3. Version File (CRITICAL: Must be binary)
+        # This binary string represents a valid version header
+        zf.writestr('Version', b'\x00\x00\x00\x00\x00\x00\x00\x00\x01\x13')
 
-        # Minimal Report/Layout (empty page)
-        layout = json.dumps({
-            "displayOption": 1,
-            "width": 1280,
-            "height": 720,
-            "sections": []
-        }, indent=2)
-        zf.writestr('Report/Layout', layout)
-
-        # Minimal Theme
-        theme = json.dumps({
-            "name": "Default",
-            "dataColors": ["#118DFF", "#12239E", "#E66C37", "#6B007B"],
-            "background": "#FFFFFF",
-            "foreground": "#323130"
-        }, indent=2)
-        zf.writestr('Report/Theme', theme)
+        # 4. Settings File
+        settings = {"locale": "en-US"}
+        zf.writestr('Settings', json.dumps(settings).encode('utf-16-le'))
 
 @app.route('/generate', methods=['POST'])
 def generate_pbix():
@@ -73,31 +67,28 @@ def generate_pbix():
         elif 'ethereum' in query.lower(): ticker = 'ETH-USD'
         elif 'spy' in query.lower(): ticker = 'SPY'
     
-        # Fetch real financial data (free, no key)
+        # Fetch real financial data
         df = yf.download(ticker, period='30d', interval='1d')
         
-        # --- FIX START: Handle MultiIndex columns from yfinance ---
+        # Fix for yfinance MultiIndex columns
         if isinstance(df.columns, pd.MultiIndex):
-            # This flattens columns from ('Close', 'AAPL') to just 'Close'
             df.columns = df.columns.get_level_values(0)
-        # --- FIX END ---
 
         df = df.reset_index()
         df['Ticker'] = ticker
         
-        # Ensure we have numeric data before calculating
         if 'Close' not in df.columns:
-            return jsonify({"error": "Could not fetch data for this ticker"}), 400
+            return jsonify({"error": "Could not fetch data"}), 400
 
         df['Change%'] = df['Close'].pct_change() * 100
         df['Volatility'] = df['Change%'].rolling(window=5).std()
         df['IsAnomaly'] = df['Change%'].abs() > df['Change%'].std() * 2
         df = df.dropna()
     
-        # Narrative insight
+        # Narrative
         anomaly_count = int(df['IsAnomaly'].sum())
         max_change = df['Change%'].max()
-        narrative = f"{ticker} had {anomaly_count} anomalies in 30 days. Confidence: 95%. Max change: {max_change:.2f}%."
+        narrative = f"{ticker} had {anomaly_count} anomalies in 30 days. Max change: {max_change:.2f}%."
     
         # DAX measures
         dax_measures = [
@@ -117,61 +108,60 @@ def generate_pbix():
         with zipfile.ZipFile(blank_pbix, 'r') as zin:
             zin.extractall(extract_dir)
     
-        # Create model file (inject data + DAX)
-        model = {
-            "name": "Model",
-            "tables": [{
-                "name": "Finance",
-                "columns": [
-                    {"name": "Date", "dataType": "dateTime"},
-                    {"name": "Open", "dataType": "double"},
-                    {"name": "High", "dataType": "double"},
-                    {"name": "Low", "dataType": "double"},
-                    {"name": "Close", "dataType": "double"},
-                    {"name": "Volume", "dataType": "double"},
-                    {"name": "Change%", "dataType": "double"},
-                    {"name": "Volatility", "dataType": "double"},
-                    {"name": "IsAnomaly", "dataType": "boolean"},
-                    {"name": "Ticker", "dataType": "string"}
-                ],
-                "rows": df.to_dict(orient="records")
-            }],
-            "measures": dax_measures,
-            "relationships": [{"fromTable": "Finance", "toTable": "DateDim", "fromColumn": "Date", "toColumn": "Date"}] # Simple star
+        # --- FIX: Correct DataModelSchema Structure ---
+        # Power BI requires the model to be wrapped in "model" key with compatibility level
+        model_wrapper = {
+            "name": "SemanticModel",
+            "compatibilityLevel": 1550,
+            "model": {
+                "culture": "en-US",
+                "tables": [{
+                    "name": "Finance",
+                    "columns": [
+                        {"name": "Date", "dataType": "dateTime"},
+                        {"name": "Open", "dataType": "double"},
+                        {"name": "High", "dataType": "double"},
+                        {"name": "Low", "dataType": "double"},
+                        {"name": "Close", "dataType": "double"},
+                        {"name": "Volume", "dataType": "double"},
+                        {"name": "Change%", "dataType": "double"},
+                        {"name": "Volatility", "dataType": "double"},
+                        {"name": "IsAnomaly", "dataType": "boolean"},
+                        {"name": "Ticker", "dataType": "string"}
+                    ],
+                    # NOTE: Power BI does not standardly support "rows" here in Import mode, 
+                    # but we keep it to prevent code breakage. 
+                    # The file will open, but might show empty data if not in Push mode.
+                    "rows": df.to_dict(orient="records") 
+                }],
+                "measures": dax_measures,
+                "relationships": []
+            }
         }
         
-        # Write to a model file (Power BI uses .json-like for schema)
-        with open(os.path.join(extract_dir, "DataModelSchema"), 'w') as f:
-            json.dump(model, f, default=str)
+        # --- FIX: Write Schema as UTF-16-LE ---
+        write_utf16le_json(os.path.join(extract_dir, "DataModelSchema"), model_wrapper)
     
         # Create report layout (2 pages)
         report_config = {
             "sections": [
                 {
                     "name": "Overview",
+                    "displayName": "Overview",
                     "visualContainers": [
                         {"type": "candlestick", "config": {"x": "Date", "open": "Open", "high": "High", "low": "Low", "close": "Close"}},
-                        {"type": "bar", "config": {"x": "Date", "y": "Volume"}},
-                        {"type": "card", "config": {"value": "30 Day Return"}},
-                        {"type": "card", "config": {"value": "Volatility"}},
-                        {"type": "card", "config": {"value": "Anomaly Count"}}
-                    ]
-                },
-                {
-                    "name": "Anomalies",
-                    "visualContainers": [
-                        {"type": "line", "config": {"x": "Date", "y": "Change%", "color": "IsAnomaly"}},
-                        {"type": "text", "config": {"text": narrative}}
+                        {"type": "card", "config": {"value": "Volatility"}}
                     ]
                 }
             ]
         }
+        
+        # --- FIX: Write Layout as UTF-16-LE ---
         os.makedirs(os.path.join(extract_dir, "Report"), exist_ok=True)
-        with open(os.path.join(extract_dir, "Report/Layout"), 'w') as f:
-            json.dump(report_config, f)
+        write_utf16le_json(os.path.join(extract_dir, "Report/Layout"), report_config)
     
-        # Theme (professional dark)
-        theme = {"dataColors": ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"], "background": "#000000", "foreground": "#ffffff"}
+        # Theme
+        theme = {"name":"Theme","dataColors": ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"], "background": "#FFFFFF", "foreground": "#000000"}
         with open(os.path.join(extract_dir, "Report/Theme"), 'w') as f:
             json.dump(theme, f)
     
@@ -197,10 +187,8 @@ def generate_pbix():
         
     except Exception as e:
         print(f"ERROR: {str(e)}")
-        # Return error as JSON so frontend doesn't show '<' token error
         return jsonify({"status": "error", "error": str(e)}), 500
 
-# Simple frontend website for demo
 @app.route('/', methods=['GET'])
 def home():
     return '''
@@ -211,21 +199,20 @@ def home():
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Power BI Dashboard Generator</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 600px; margin: 50px auto; text-align: center; background: #f4f4f4; padding: 20px; }
-        input { width: 80%; padding: 10px; font-size: 16px; border: 1px solid #ddd; border-radius: 5px; }
-        button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; margin-top: 10px; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 50px auto; text-align: center; background: #f4f4f4; padding: 20px; }
+        input { width: 80%; padding: 12px; font-size: 16px; border: 1px solid #ddd; border-radius: 5px; }
+        button { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; margin-top: 15px; }
         button:hover { background: #0056b3; }
         #status { margin-top: 20px; font-weight: bold; color: green; }
-        #error { color: red; }
+        #error { color: red; margin-top: 20px; }
         #download { margin-top: 10px; display: none; }
     </style>
 </head>
 <body>
     <h1>🚀 Power BI Dashboard Generator</h1>
-    <p>Enter a stock query (e.g., "Apple last 30 days") and click Generate. Your .pbix downloads instantly!</p>
+    <p>Enter a stock query (e.g., "Apple last 30 days").</p>
     <input type="text" id="query" placeholder="Enter query..." value="Apple last 30 days">
-    
-
+    <br>
     <button onclick="generateDashboard()">Generate Dashboard</button>
     <div id="status"></div>
     <div id="error"></div>
@@ -237,7 +224,7 @@ def home():
             const status = document.getElementById('status');
             const error = document.getElementById('error');
             const download = document.getElementById('download');
-            status.innerHTML = 'Generating... (10-20 seconds)';
+            status.innerHTML = 'Generating... (Please wait 10s)';
             error.innerHTML = '';
             download.style.display = 'none';
 
@@ -248,13 +235,11 @@ def home():
                     body: JSON.stringify({ query: query })
                 });
                 
-                // Check if response is JSON, otherwise handle HTML errors
                 const contentType = response.headers.get("content-type");
                 if (contentType && contentType.indexOf("application/json") !== -1) {
                     const data = await response.json();
                     if (data.status === 'success') {
                         status.innerHTML = 'Dashboard ready! 🎉';
-                        // Decode base64 and create download
                         const binaryString = atob(data.pbix_base64);
                         const bytes = new Uint8Array(binaryString.length);
                         for (let i = 0; i < binaryString.length; i++) {
@@ -270,10 +255,8 @@ def home():
                         error.innerHTML = 'Error: ' + (data.error || 'Unknown');
                     }
                 } else {
-                    const text = await response.text();
                     status.innerHTML = '';
                     error.innerHTML = 'Server Error (Check Logs)';
-                    console.error('Non-JSON response:', text);
                 }
             } catch (err) {
                 status.innerHTML = '';

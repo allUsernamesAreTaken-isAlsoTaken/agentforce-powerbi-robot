@@ -6,16 +6,61 @@ import zipfile
 import os
 import shutil
 import base64
-import urllib.request
 from datetime import datetime, timedelta
+
 app = Flask(__name__)
-# Download blank PBIX once (Microsoft's official blank file)
-BLANK_PBIX = "blank.pbix"
-if not os.path.exists(BLANK_PBIX):
-    urllib.request.urlretrieve(
-        "https://github.com/microsoft/powerbi-desktop-samples/raw/main/Sample%20Reports/Blank%20Report.pbix",
-        BLANK_PBIX
-    )
+
+# Create minimal blank PBIX from scratch (no download needed)
+def create_blank_pbix(filename):
+    with zipfile.ZipFile(filename, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # [Content_Types].xml
+        content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="bin" ContentType="application/vnd.ms-publisher.binary"/>
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Override PartName="/Report/Layout" ContentType="application/vnd.ms-powerbi.content.layout+json"/>
+  <Override PartName="/DataModelSchema" ContentType="application/json"/>
+  <Override PartName="/StaticResources/Media/Images" ContentType="application/vnd.openxmlformats-officedocument.oleObject"/>
+  <Override PartName="/Report/Theme" ContentType="application/vnd.ms-powerbi.content.theme+json"/>
+</Types>'''
+        zf.writestr('[Content_Types].xml', content_types)
+
+        # _rels/.rels
+        rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.microsoft.com/powerbi/2016/06/reportlayout" Target="Report/Layout"/>
+  <Relationship Id="rId2" Type="http://schemas.microsoft.com/powerbi/2016/06/datamodelschema" Target="DataModelSchema"/>
+  <Relationship Id="rId3" Type="http://schemas.microsoft.com/powerbi/2016/06/theme" Target="Report/Theme"/>
+</Relationships>'''
+        zf.writestr('_rels/.rels', rels)
+
+        # Minimal DataModelSchema (empty model)
+        schema = json.dumps({
+            "name": "Model",
+            "tables": [],
+            "relationships": []
+        }, indent=2)
+        zf.writestr('DataModelSchema', schema)
+
+        # Minimal Report/Layout (empty page)
+        layout = json.dumps({
+            "displayOption": 1,
+            "width": 1280,
+            "height": 720,
+            "sections": []
+        }, indent=2)
+        zf.writestr('Report/Layout', layout)
+
+        # Minimal Theme
+        theme = json.dumps({
+            "name": "Default",
+            "dataColors": ["#118DFF", "#12239E", "#E66C37", "#6B007B"],
+            "background": "#FFFFFF",
+            "foreground": "#323130"
+        }, indent=2)
+        zf.writestr('Report/Theme', theme)
+
 @app.route('/generate', methods=['POST'])
 def generate_pbix():
     query = request.json.get('query', 'Tesla last 30 days')
@@ -48,10 +93,14 @@ def generate_pbix():
         {"name": "Anomaly Count", "expression": "COUNTROWS(FILTER(Finance, Finance[IsAnomaly] = TRUE))"}
     ]
    
+    # Create blank PBIX
+    blank_pbix = "blank.pbix"
+    create_blank_pbix(blank_pbix)
+   
     # Unzip blank PBIX
     extract_dir = "pbix_extracted"
     shutil.rmtree(extract_dir, ignore_errors=True)
-    with zipfile.ZipFile(BLANK_PBIX, 'r') as zin:
+    with zipfile.ZipFile(blank_pbix, 'r') as zin:
         zin.extractall(extract_dir)
    
     # Create model file (inject data + DAX)
@@ -77,7 +126,7 @@ def generate_pbix():
         "relationships": [{"fromTable": "Finance", "toTable": "DateDim", "fromColumn": "Date", "toColumn": "Date"}] # Simple star
     }
     # Write to a model file (Power BI uses .json-like for schema)
-    with open(os.path.join(extract_dir, "DataModelSchema.json"), 'w') as f:
+    with open(os.path.join(extract_dir, "DataModelSchema"), 'w') as f:
         json.dump(model, f, default=str)
    
     # Create report layout (2 pages)
@@ -103,12 +152,12 @@ def generate_pbix():
         ]
     }
     os.makedirs(os.path.join(extract_dir, "Report"), exist_ok=True)
-    with open(os.path.join(extract_dir, "Report/Layout.json"), 'w') as f:
+    with open(os.path.join(extract_dir, "Report/Layout"), 'w') as f:
         json.dump(report_config, f)
    
     # Theme (professional dark)
     theme = {"dataColors": ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"], "background": "#000000", "foreground": "#ffffff"}
-    with open(os.path.join(extract_dir, "Report/Theme.json"), 'w') as f:
+    with open(os.path.join(extract_dir, "Report/Theme"), 'w') as f:
         json.dump(theme, f)
    
     # Re-zip to .pbix
@@ -119,15 +168,15 @@ def generate_pbix():
                 zout.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), extract_dir))
    
     shutil.rmtree(extract_dir)
+    os.remove(blank_pbix)
    
-    # Base64 for Salesforce download
+    # Base64 for download
     with open(output_pbix, "rb") as f:
         pbix_b64 = base64.b64encode(f.read()).decode('utf-8')
     os.remove(output_pbix)
    
     return jsonify({"pbix_base64": pbix_b64, "narrative": narrative, "status": "success"})
 
-# INSERT THE NEW ROUTE HERE (the frontend HTML code goes exactly here)
 # Simple frontend website for demo
 @app.route('/', methods=['GET'])
 def home():

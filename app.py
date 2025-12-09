@@ -10,23 +10,25 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# --- Helper: Write file with UTF-16-LE encoding (Required for Power BI) ---
+# --- Helper: Write file with UTF-16-LE encoding ---
 def write_utf16le_json(filename, data):
     with open(filename, 'wb') as f:
+        # PBI requires specific encoding for schema files
         json_str = json.dumps(data, indent=2, default=str)
         f.write(json_str.encode('utf-16-le'))
 
 # --- Helper: Generate DAX DATATABLE expression ---
 def generate_dax_datatable(df):
-    # This creates a massive DAX string that contains the actual data
     dax = "DATATABLE (\n"
     dax += '    "Date", DATETIME, "Open", DOUBLE, "High", DOUBLE, "Low", DOUBLE, "Close", DOUBLE, "Volume", INTEGER, "ChangePerc", DOUBLE, "Volatility", DOUBLE, "IsAnomaly", BOOLEAN, "Ticker", STRING,\n    {\n'
     
     rows = []
     for _, row in df.iterrows():
+        # Format date as string safe for DAX
         date_str = row['Date'].strftime('%Y-%m-%d %H:%M:%S')
         anomaly_val = "TRUE" if row['IsAnomaly'] else "FALSE"
-        # DAX requires specific formatting for rows
+        
+        # Construct row
         row_str = f'        {{ "{date_str}", {row["Open"]}, {row["High"]}, {row["Low"]}, {row["Close"]}, {int(row["Volume"])}, {row["Change%"]}, {row["Volatility"]}, {anomaly_val}, "{row["Ticker"]}" }}'
         rows.append(row_str)
     
@@ -34,9 +36,8 @@ def generate_dax_datatable(df):
     dax += "\n    }\n)"
     return dax
 
-# --- Helper: Create Visual JSON Config ---
+# --- Helper: Create Visual Configs ---
 def create_visual(type, x, y, w, h, name, column_name):
-    # Map simple types to Power BI visual IDs
     visual_type_map = { "line": "lineChart", "bar": "columnChart", "card": "card" }
     v_type = visual_type_map.get(type, "lineChart")
     
@@ -57,7 +58,6 @@ def create_visual(type, x, y, w, h, name, column_name):
         }
     }
     
-    # Charts need an X-Axis (Date), Cards do not
     if type != "card":
         config["singleVisual"]["projections"]["Category"] = [{"queryRef": "Finance.Date"}]
         config["singleVisual"]["prototypeQuery"]["Select"].append(
@@ -69,10 +69,10 @@ def create_visual(type, x, y, w, h, name, column_name):
         "config": json.dumps(config)
     }
 
-# --- Create Blank PBIT Structure (No DataModel Binary) ---
-def create_blank_pbit_structure(filename):
+# --- Create STRICT PBIT Structure (No DataModel) ---
+def create_strict_pbit_structure(filename):
     with zipfile.ZipFile(filename, 'w', zipfile.ZIP_DEFLATED) as zf:
-        # 1. [Content_Types].xml - Defines the files inside the zip
+        # 1. [Content_Types].xml (REMOVED DataModel override)
         content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="json" ContentType="application/json"/>
@@ -87,7 +87,7 @@ def create_blank_pbit_structure(filename):
 </Types>'''
         zf.writestr('[Content_Types].xml', content_types)
 
-        # 2. _rels/.rels - Defines relationships (Notice: NO DataModel here)
+        # 2. _rels/.rels (REMOVED DataModel relationship)
         rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.microsoft.com/powerbi/2016/06/reportlayout" Target="Report/Layout"/>
@@ -99,14 +99,14 @@ def create_blank_pbit_structure(filename):
 </Relationships>'''
         zf.writestr('_rels/.rels', rels)
 
-        # 3. Version (Binary Header)
+        # 3. Version
         zf.writestr('Version', b'\x00\x00\x00\x00\x00\x00\x00\x00\x01\x13')
         
         # 4. Settings
         settings = {"locale": "en-US"}
         zf.writestr('Settings', json.dumps(settings).encode('utf-16-le'))
         
-        # 5. Metadata (Required for PBIT)
+        # 5. Metadata
         metadata = {"type": "Report", "name": "GeneratedReport"}
         zf.writestr('Metadata', json.dumps(metadata).encode('utf-8'))
 
@@ -138,19 +138,19 @@ def generate_pbix():
         dax_data_expression = generate_dax_datatable(df)
         narrative = f"{ticker}: {int(df['IsAnomaly'].sum())} anomalies. Max Move: {df['Change%'].max():.2f}%"
 
-        # Prepare Extract Directory
+        # Prepare Folder
         extract_dir = "pbit_extracted"
         shutil.rmtree(extract_dir, ignore_errors=True)
         os.makedirs(extract_dir, exist_ok=True)
         
-        # Create the Base Structure
+        # Create Strict Structure
         temp_zip = "temp_structure.zip"
-        create_blank_pbit_structure(temp_zip)
+        create_strict_pbit_structure(temp_zip)
         with zipfile.ZipFile(temp_zip, 'r') as zin:
             zin.extractall(extract_dir)
         os.remove(temp_zip)
 
-        # 1. MODEL SCHEMA (The Core)
+        # 1. MODEL SCHEMA
         model_wrapper = {
             "name": "SemanticModel",
             "compatibilityLevel": 1550,
@@ -181,16 +181,12 @@ def generate_pbix():
         write_utf16le_json(os.path.join(extract_dir, "DataModelSchema"), model_wrapper)
 
         # 2. REPORT LAYOUT
-        # KPI Cards
         card_close = create_visual("card", 10, 10, 300, 150, "CardClose", "Close")
         card_high = create_visual("card", 320, 10, 300, 150, "CardHigh", "High")
         card_vol = create_visual("card", 630, 10, 300, 150, "CardVol", "Volume")
-        
-        # Charts
         line_chart = create_visual("line", 10, 170, 920, 350, "MainChart", "Close")
         bar_chart = create_visual("bar", 10, 530, 920, 150, "VolChart", "Volume")
         
-        # Text Box
         text_box = {
              "x": 10, "y": 690, "width": 920, "height": 50,
              "config": json.dumps({
@@ -216,7 +212,7 @@ def generate_pbix():
         theme = {"name":"Theme","dataColors": ["#118DFF", "#12239E", "#E66C37", "#6B007B"], "background": "#FFFFFF", "foreground": "#000000"}
         with open(os.path.join(extract_dir, "Report/Theme"), 'w') as f: json.dump(theme, f)
 
-        # 4. ZIP TO .PBIT (Template)
+        # 4. ZIP TO .PBIT
         output_filename = f"{ticker}_dashboard.pbit"
         with zipfile.ZipFile(output_filename, 'w', zipfile.ZIP_DEFLATED) as zout:
             for root, _, files in os.walk(extract_dir):
@@ -225,7 +221,6 @@ def generate_pbix():
 
         shutil.rmtree(extract_dir)
         
-        # Encode
         with open(output_filename, "rb") as f:
             pbix_b64 = base64.b64encode(f.read()).decode('utf-8')
         if os.path.exists(output_filename): os.remove(output_filename)
@@ -252,7 +247,6 @@ def home():
         #status { margin-top: 20px; font-weight: bold; color: green; }
         #error { color: red; margin-top: 20px; }
         #download { margin-top: 10px; display: none; }
-        .note { font-size: 12px; color: #666; margin-top: 5px; }
     </style>
 </head>
 <body>
@@ -264,8 +258,7 @@ def home():
     <div id="status"></div>
     <div id="error"></div>
     <a id="download"><button>Download Dashboard (.pbit)</button></a>
-    <p class="note">Note: This downloads a <b>.pbit</b> template. Open it in Power BI Desktop and it will automatically build your dashboard.</p>
-
+    
     <script>
         async function generateDashboard() {
             const query = document.getElementById('query').value;
@@ -296,7 +289,6 @@ def home():
                         const blob = new Blob([bytes], { type: 'application/octet-stream' });
                         const url = URL.createObjectURL(blob);
                         download.href = url;
-                        // Extension is now .pbit
                         download.download = query.replace(/[^a-z0-9]/gi, '_').toLowerCase() + '_dashboard.pbit';
                         download.style.display = 'inline';
                     } else {

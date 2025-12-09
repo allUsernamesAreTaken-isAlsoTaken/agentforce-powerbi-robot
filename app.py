@@ -10,26 +10,23 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# --- Helper: Write file with UTF-16-LE encoding (Required for PBI) ---
+# --- Helper: Write file with UTF-16-LE encoding (Required for Power BI) ---
 def write_utf16le_json(filename, data):
     with open(filename, 'wb') as f:
         json_str = json.dumps(data, indent=2, default=str)
         f.write(json_str.encode('utf-16-le'))
 
-# --- Helper: Generate DAX DATATABLE expression from DataFrame ---
+# --- Helper: Generate DAX DATATABLE expression ---
 def generate_dax_datatable(df):
-    # Construct the header
+    # This creates a massive DAX string that contains the actual data
     dax = "DATATABLE (\n"
     dax += '    "Date", DATETIME, "Open", DOUBLE, "High", DOUBLE, "Low", DOUBLE, "Close", DOUBLE, "Volume", INTEGER, "ChangePerc", DOUBLE, "Volatility", DOUBLE, "IsAnomaly", BOOLEAN, "Ticker", STRING,\n    {\n'
     
-    # Construct rows
     rows = []
     for _, row in df.iterrows():
-        # Format date safely
         date_str = row['Date'].strftime('%Y-%m-%d %H:%M:%S')
-        # Handle boolean
         anomaly_val = "TRUE" if row['IsAnomaly'] else "FALSE"
-        
+        # DAX requires specific formatting for rows
         row_str = f'        {{ "{date_str}", {row["Open"]}, {row["High"]}, {row["Low"]}, {row["Close"]}, {int(row["Volume"])}, {row["Change%"]}, {row["Volatility"]}, {anomaly_val}, "{row["Ticker"]}" }}'
         rows.append(row_str)
     
@@ -37,26 +34,60 @@ def generate_dax_datatable(df):
     dax += "\n    }\n)"
     return dax
 
-# --- Create Blank PBIX Structure ---
-def create_blank_pbix(filename):
+# --- Helper: Create Visual JSON Config ---
+def create_visual(type, x, y, w, h, name, column_name):
+    # Map simple types to Power BI visual IDs
+    visual_type_map = { "line": "lineChart", "bar": "columnChart", "card": "card" }
+    v_type = visual_type_map.get(type, "lineChart")
+    
+    config = {
+        "name": name,
+        "singleVisual": {
+            "visualType": v_type,
+            "projections": {
+                "Y": [{"queryRef": f"Finance.{column_name}"}]
+            },
+            "prototypeQuery": {
+                "Version": 2,
+                "From": [{"Name": "f", "Entity": "Finance", "Type": 0}],
+                "Select": [
+                    {"Column": {"Expression": {"SourceRef": {"Source": "f"}}, "Property": column_name}, "Name": f"Finance.{column_name}"}
+                ]
+            }
+        }
+    }
+    
+    # Charts need an X-Axis (Date), Cards do not
+    if type != "card":
+        config["singleVisual"]["projections"]["Category"] = [{"queryRef": "Finance.Date"}]
+        config["singleVisual"]["prototypeQuery"]["Select"].append(
+            {"Column": {"Expression": {"SourceRef": {"Source": "f"}}, "Property": "Date"}, "Name": "Finance.Date"}
+        )
+
+    return {
+        "x": x, "y": y, "width": w, "height": h,
+        "config": json.dumps(config)
+    }
+
+# --- Create Blank PBIT Structure (No DataModel Binary) ---
+def create_blank_pbit_structure(filename):
     with zipfile.ZipFile(filename, 'w', zipfile.ZIP_DEFLATED) as zf:
-        # [Content_Types].xml
+        # 1. [Content_Types].xml - Defines the files inside the zip
         content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="xml" ContentType="application/xml"/>
   <Default Extension="json" ContentType="application/json"/>
-  <Default Extension="bin" ContentType="application/vnd.ms-publisher.binary"/>
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/Report/Layout" ContentType="application/vnd.ms-powerbi.content.layout+json"/>
   <Override PartName="/DataModelSchema" ContentType="application/vnd.ms-powerbi.content.schema+json"/>
   <Override PartName="/Report/Theme" ContentType="application/vnd.ms-powerbi.content.theme+json"/>
   <Override PartName="/Settings" ContentType="application/vnd.ms-powerbi.content.settings+json"/>
   <Override PartName="/Version" ContentType="application/vnd.ms-powerbi.content.version+binary"/>
-  <Override PartName="/DataModel" ContentType="application/vnd.ms-powerbi.content.model+binary"/>
+  <Override PartName="/Metadata" ContentType="application/json"/>
 </Types>'''
         zf.writestr('[Content_Types].xml', content_types)
 
-        # _rels/.rels
+        # 2. _rels/.rels - Defines relationships (Notice: NO DataModel here)
         rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.microsoft.com/powerbi/2016/06/reportlayout" Target="Report/Layout"/>
@@ -64,70 +95,62 @@ def create_blank_pbix(filename):
   <Relationship Id="rId3" Type="http://schemas.microsoft.com/powerbi/2016/06/theme" Target="Report/Theme"/>
   <Relationship Id="rId4" Type="http://schemas.microsoft.com/powerbi/2016/06/settings" Target="Settings"/>
   <Relationship Id="rId5" Type="http://schemas.microsoft.com/powerbi/2016/06/version" Target="Version"/>
-  <Relationship Id="rId6" Type="http://schemas.microsoft.com/powerbi/2016/06/model" Target="DataModel"/>
+  <Relationship Id="rId6" Type="http://schemas.microsoft.com/powerbi/2016/06/metadata" Target="Metadata"/>
 </Relationships>'''
         zf.writestr('_rels/.rels', rels)
 
-        # Version (Valid Binary Header)
+        # 3. Version (Binary Header)
         zf.writestr('Version', b'\x00\x00\x00\x00\x00\x00\x00\x00\x01\x13')
         
-        # DataModel (Dummy Binary - Power BI will rebuild this from the Schema)
-        # We write a minimal valid header to trick PBI into thinking it exists
-        zf.writestr('DataModel', b'\x00\x00\x00\x00')
-
-        # Settings
+        # 4. Settings
         settings = {"locale": "en-US"}
         zf.writestr('Settings', json.dumps(settings).encode('utf-16-le'))
+        
+        # 5. Metadata (Required for PBIT)
+        metadata = {"type": "Report", "name": "GeneratedReport"}
+        zf.writestr('Metadata', json.dumps(metadata).encode('utf-8'))
 
 @app.route('/generate', methods=['POST'])
 def generate_pbix():
     try:
         query = request.json.get('query', 'Tesla last 30 days')
-        
-        # 1. Ticker Logic
         ticker = 'TSLA'
         if 'apple' in query.lower(): ticker = 'AAPL'
         elif 'bitcoin' in query.lower(): ticker = 'BTC-USD'
         elif 'ethereum' in query.lower(): ticker = 'ETH-USD'
         elif 'spy' in query.lower(): ticker = 'SPY'
     
-        # 2. Fetch Data
+        # Fetch Data
         df = yf.download(ticker, period='30d', interval='1d')
-        
-        # Fix MultiIndex columns
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df = df.reset_index()
         df['Ticker'] = ticker
         
-        # Validation
-        if 'Close' not in df.columns or df.empty:
-            return jsonify({"error": "No data found"}), 400
+        if 'Close' not in df.columns or df.empty: return jsonify({"error": "No data found"}), 400
 
         # Calculations
         df['Change%'] = df['Close'].pct_change() * 100
         df['Volatility'] = df['Change%'].rolling(window=5).std()
         df['IsAnomaly'] = df['Change%'].abs() > df['Change%'].std() * 2
-        df = df.dropna().fillna(0) # Ensure no NaNs for DAX
+        df = df.dropna().fillna(0)
 
-        # 3. Generate DAX Data String
+        # Generate DAX
         dax_data_expression = generate_dax_datatable(df)
-    
-        # Narrative
-        anomaly_count = int(df['IsAnomaly'].sum())
-        max_change = df['Change%'].max()
-        narrative = f"{ticker}: {anomaly_count} anomalies. Max Move: {max_change:.2f}%"
+        narrative = f"{ticker}: {int(df['IsAnomaly'].sum())} anomalies. Max Move: {df['Change%'].max():.2f}%"
 
-        # 4. Prepare Files
-        blank_pbix = "blank.pbix"
-        create_blank_pbix(blank_pbix)
-        extract_dir = "pbix_extracted"
+        # Prepare Extract Directory
+        extract_dir = "pbit_extracted"
         shutil.rmtree(extract_dir, ignore_errors=True)
-        with zipfile.ZipFile(blank_pbix, 'r') as zin:
+        os.makedirs(extract_dir, exist_ok=True)
+        
+        # Create the Base Structure
+        temp_zip = "temp_structure.zip"
+        create_blank_pbit_structure(temp_zip)
+        with zipfile.ZipFile(temp_zip, 'r') as zin:
             zin.extractall(extract_dir)
+        os.remove(temp_zip)
 
-        # 5. Build Model Schema (with Calculated Table)
+        # 1. MODEL SCHEMA (The Core)
         model_wrapper = {
             "name": "SemanticModel",
             "compatibilityLevel": 1550,
@@ -142,7 +165,7 @@ def generate_pbix():
                         {"name": "Low", "dataType": "double"},
                         {"name": "Close", "dataType": "double"},
                         {"name": "Volume", "dataType": "int64"},
-                        {"name": "ChangePerc", "dataType": "double"}, # Renamed from Change% to avoid DAX issues
+                        {"name": "ChangePerc", "dataType": "double"},
                         {"name": "Volatility", "dataType": "double"},
                         {"name": "IsAnomaly", "dataType": "boolean"},
                         {"name": "Ticker", "dataType": "string"}
@@ -150,81 +173,62 @@ def generate_pbix():
                     "partitions": [{
                         "name": "Finance",
                         "mode": "import",
-                        "source": {
-                            "type": "calculated",
-                            "expression": dax_data_expression
-                        }
+                        "source": { "type": "calculated", "expression": dax_data_expression }
                     }]
-                }],
-                "relationships": []
+                }]
             }
         }
         write_utf16le_json(os.path.join(extract_dir, "DataModelSchema"), model_wrapper)
 
-        # 6. Report Layout
+        # 2. REPORT LAYOUT
+        # KPI Cards
+        card_close = create_visual("card", 10, 10, 300, 150, "CardClose", "Close")
+        card_high = create_visual("card", 320, 10, 300, 150, "CardHigh", "High")
+        card_vol = create_visual("card", 630, 10, 300, 150, "CardVol", "Volume")
+        
+        # Charts
+        line_chart = create_visual("line", 10, 170, 920, 350, "MainChart", "Close")
+        bar_chart = create_visual("bar", 10, 530, 920, 150, "VolChart", "Volume")
+        
+        # Text Box
+        text_box = {
+             "x": 10, "y": 690, "width": 920, "height": 50,
+             "config": json.dumps({
+                 "name": "TextBox1",
+                 "singleVisual": {
+                     "visualType": "textbox",
+                     "objects": { "general": [{"properties": {"paragraphs": [{"textRuns": [{"value": narrative}]}]}}] }
+                 }
+             })
+        }
+
         report_config = {
             "sections": [{
                 "name": "ReportSection1",
                 "displayName": "Overview",
-                "visualContainers": [
-                    {
-                        "x": 100, "y": 100, "width": 800, "height": 400,
-                        "config": json.dumps({
-                            "name": "Visual1",
-                            "singleVisual": {
-                                "visualType": "lineChart",
-                                "projections": {
-                                    "Category": [{"queryRef": "Finance.Date"}],
-                                    "Y": [{"queryRef": "Finance.Close"}]
-                                },
-                                "prototypeQuery": {
-                                    "Version": 2,
-                                    "From": [{"Name": "f", "Entity": "Finance", "Type": 0}],
-                                    "Select": [
-                                        {"Column": {"Expression": {"SourceRef": {"Source": "f"}}, "Property": "Date"}, "Name": "Finance.Date"},
-                                        {"Column": {"Expression": {"SourceRef": {"Source": "f"}}, "Property": "Close"}, "Name": "Finance.Close"}
-                                    ]
-                                }
-                            }
-                        })
-                    },
-                    {
-                         "x": 100, "y": 550, "width": 800, "height": 100,
-                         "config": json.dumps({
-                             "name": "TextBox1",
-                             "singleVisual": {
-                                 "visualType": "textbox",
-                                 "objects": {
-                                     "general": [{"properties": {"paragraphs": [{"textRuns": [{"value": narrative}]}]}}]
-                                 }
-                             }
-                         })
-                    }
-                ]
+                "visualContainers": [card_close, card_high, card_vol, line_chart, bar_chart, text_box]
             }]
         }
         os.makedirs(os.path.join(extract_dir, "Report"), exist_ok=True)
         write_utf16le_json(os.path.join(extract_dir, "Report/Layout"), report_config)
 
-        # 7. Theme
+        # 3. THEME
         theme = {"name":"Theme","dataColors": ["#118DFF", "#12239E", "#E66C37", "#6B007B"], "background": "#FFFFFF", "foreground": "#000000"}
-        with open(os.path.join(extract_dir, "Report/Theme"), 'w') as f:
-            json.dump(theme, f)
+        with open(os.path.join(extract_dir, "Report/Theme"), 'w') as f: json.dump(theme, f)
 
-        # 8. Re-zip
-        output_pbix = f"{ticker}_dashboard.pbix"
-        with zipfile.ZipFile(output_pbix, 'w', zipfile.ZIP_DEFLATED) as zout:
+        # 4. ZIP TO .PBIT (Template)
+        output_filename = f"{ticker}_dashboard.pbit"
+        with zipfile.ZipFile(output_filename, 'w', zipfile.ZIP_DEFLATED) as zout:
             for root, _, files in os.walk(extract_dir):
                 for file in files:
                     zout.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), extract_dir))
 
         shutil.rmtree(extract_dir)
-        if os.path.exists(blank_pbix): os.remove(blank_pbix)
-
-        # 9. Return Base64
-        with open(output_pbix, "rb") as f:
+        
+        # Encode
+        with open(output_filename, "rb") as f:
             pbix_b64 = base64.b64encode(f.read()).decode('utf-8')
-        if os.path.exists(output_pbix): os.remove(output_pbix)
+        if os.path.exists(output_filename): os.remove(output_filename)
 
         return jsonify({"pbix_base64": pbix_b64, "narrative": narrative, "status": "success"})
 
@@ -239,7 +243,6 @@ def home():
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Power BI Dashboard Generator</title>
     <style>
         body { font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 50px auto; text-align: center; background: #f4f4f4; padding: 20px; }
@@ -249,6 +252,7 @@ def home():
         #status { margin-top: 20px; font-weight: bold; color: green; }
         #error { color: red; margin-top: 20px; }
         #download { margin-top: 10px; display: none; }
+        .note { font-size: 12px; color: #666; margin-top: 5px; }
     </style>
 </head>
 <body>
@@ -259,7 +263,8 @@ def home():
     <button onclick="generateDashboard()">Generate Dashboard</button>
     <div id="status"></div>
     <div id="error"></div>
-    <a id="download"><button>Download PBIX File</button></a>
+    <a id="download"><button>Download Dashboard (.pbit)</button></a>
+    <p class="note">Note: This downloads a <b>.pbit</b> template. Open it in Power BI Desktop and it will automatically build your dashboard.</p>
 
     <script>
         async function generateDashboard() {
@@ -291,7 +296,8 @@ def home():
                         const blob = new Blob([bytes], { type: 'application/octet-stream' });
                         const url = URL.createObjectURL(blob);
                         download.href = url;
-                        download.download = query.replace(/[^a-z0-9]/gi, '_').toLowerCase() + '_dashboard.pbix';
+                        // Extension is now .pbit
+                        download.download = query.replace(/[^a-z0-9]/gi, '_').toLowerCase() + '_dashboard.pbit';
                         download.style.display = 'inline';
                     } else {
                         status.innerHTML = '';

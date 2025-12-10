@@ -1,180 +1,228 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import google.generativeai as genai
 from datetime import datetime, timedelta
 
-# --- 1. Page Configuration (The "Canvas") ---
+# --- 1. Page Config & Advanced Styling ---
 st.set_page_config(
-    page_title="AI Financial Dashboard",
-    page_icon="📊",
-    layout="wide", # Uses the full width like a Power BI report
+    page_title="ProTraders AI Dashboard",
+    page_icon="📈",
+    layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS to mimic Power BI's clean look
+# Custom CSS for a Professional Dark Theme
 st.markdown("""
 <style>
-    .metric-card {
-        background-color: #0e1117;
-        border: 1px solid #262730;
-        padding: 20px;
-        border-radius: 10px;
-        text-align: center;
+    .stApp { background-color: #0e1117; color: #FAFAFA; }
+    .stTabs [data-baseweb="tab-list"] { gap: 24px; }
+    .stTabs [data-baseweb="tab"] {
+        height: 50px; white-space: pre-wrap; background-color: #0e1117;
+        border-radius: 4px 4px 0px 0px; gap: 1px; padding-top: 10px; padding-bottom: 10px;
     }
-    .stApp {
-        background-color: #000000;
-        color: white;
+    .metric-card {
+        background-color: #1a1c24; border: 1px solid #30333d;
+        padding: 15px; border-radius: 8px; text-align: center;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. Sidebar (The "Slicers") ---
-with st.sidebar:
-    st.header("⚙️ Dashboard Controls")
-    query = st.text_input("Stock Query", value="Tesla last 30 days")
-    
-    # Simple parser to find ticker
-    ticker = "TSLA"
-    if 'apple' in query.lower(): ticker = "AAPL"
-    elif 'bitcoin' in query.lower(): ticker = "BTC-USD"
-    elif 'ethereum' in query.lower(): ticker = "ETH-USD"
-    elif 'spy' in query.lower(): ticker = "SPY"
-    elif 'nvidia' in query.lower(): ticker = "NVDA"
-    elif 'microsoft' in query.lower(): ticker = "MSFT"
-    elif 'google' in query.lower(): ticker = "GOOGL"
+# --- 2. Helper Functions ---
 
-    st.info(f"Detected Ticker: **{ticker}**")
-    
-    if st.button("🔄 Generate Report", type="primary"):
-        st.session_state['generate'] = True
-
-# --- 3. Main Logic (The "Power Query" Engine) ---
-if st.session_state.get('generate'):
-    
-    # A. Fetch Data
+def get_ticker_from_llm(user_query, api_key):
     try:
-        with st.spinner(f"Fetching data for {ticker}..."):
-            df = yf.download(ticker, period="30d", interval="1d")
-            
-            # Fix MultiIndex columns (The original error fix)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        prompt = f"""
+        Identify the stock ticker for: "{user_query}".
+        Return ONLY the ticker (e.g., AAPL, BTC-USD). If unclear, return "ERROR".
+        """
+        response = model.generate_content(prompt)
+        return response.text.strip().upper().replace('*', '').replace('`', '')
+    except:
+        return "ERROR"
+
+def calculate_technicals(df):
+    # Simple Moving Averages
+    df['SMA_20'] = df['Close'].rolling(window=20).mean()
+    df['SMA_50'] = df['Close'].rolling(window=50).mean()
+    
+    # Bollinger Bands
+    df['BB_Middle'] = df['Close'].rolling(window=20).mean()
+    df['BB_Std'] = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = df['BB_Middle'] + (df['BB_Std'] * 2)
+    df['BB_Lower'] = df['BB_Middle'] - (df['BB_Std'] * 2)
+    
+    # RSI (Relative Strength Index)
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    return df
+
+# --- 3. Sidebar ---
+with st.sidebar:
+    st.title("⚡ ProTraders AI")
+    
+    # API Key
+    api_key = st.text_input("🔑 Gemini API Key", type="password")
+    
+    st.divider()
+    
+    # Search Controls
+    query = st.text_input("Search Market", value="Nvidia")
+    timeframe = st.selectbox("Timeframe", ["1mo", "3mo", "6mo", "1y", "ytd"], index=2)
+    
+    # Technical Overlays
+    st.subheader("Chart Overlays")
+    show_sma = st.checkbox("Show SMA (20 & 50)", value=True)
+    show_bb = st.checkbox("Show Bollinger Bands", value=False)
+    
+    run_btn = st.button("🚀 Analyze Market", type="primary")
+
+# --- 4. Main App Logic ---
+if run_btn:
+    if not api_key:
+        st.error("Please provide a Google Gemini API Key in the sidebar.")
+        st.stop()
+
+    # A. Ticker Identification
+    with st.spinner("🔍 Identifying Asset..."):
+        ticker = get_ticker_from_llm(query, api_key)
+    
+    if ticker == "ERROR" or not ticker:
+        st.error("Could not identify ticker. Try entering the symbol directly.")
+        st.stop()
+
+    # B. Fetch Data
+    try:
+        with st.spinner(f"📥 Loading Data for {ticker}..."):
+            # Get History
+            df = yf.download(ticker, period=timeframe, interval="1d")
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df = df.reset_index()
+            
+            # Get Fundamentals
+            stock_info = yf.Ticker(ticker).info
+            
+            # Run Technical Calculations
+            df = calculate_technicals(df)
 
         if df.empty:
-            st.error("No data found. Please try a different ticker.")
+            st.error("No market data found.")
             st.stop()
 
-        # B. Calculate Measures (DAX equivalent)
-        df['Change%'] = df['Close'].pct_change() * 100
-        df['Volatility'] = df['Change%'].rolling(window=5).std()
-        df['IsAnomaly'] = df['Change%'].abs() > df['Change%'].std() * 2
-        
-        # Narrative Calculation
-        current_price = df['Close'].iloc[-1]
-        start_price = df['Close'].iloc[0]
-        return_30d = ((current_price - start_price) / start_price) * 100
-        anomaly_count = int(df['IsAnomaly'].sum())
-        max_volatility = df['Volatility'].max()
-        
-        narrative = f"""
-        **AI Insight:** {ticker} has shown a **{return_30d:.2f}%** return over the last 30 days. 
-        We detected **{anomaly_count} anomalies** in price movement, suggesting periods of high instability. 
-        The maximum volatility recorded was **{max_volatility:.2f}**.
-        """
+        # C. AI Analysis Generation
+        with st.spinner("🧠 AI Analyst is thinking..."):
+            current_price = df['Close'].iloc[-1]
+            rsi_val = df['RSI'].iloc[-1]
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            
+            analysis_prompt = f"""
+            Analyze {ticker}. Current Price: ${current_price:.2f}. RSI: {rsi_val:.2f}.
+            Trend: Last 30 days return is {((df['Close'].iloc[-1] - df['Close'].iloc[0])/df['Close'].iloc[0]*100):.2f}%.
+            Provide a 3-bullet point technical summary:
+            1. Trend Sentiment (Bullish/Bearish).
+            2. Key Support/Resistance (Estimate based on recent highs/lows).
+            3. Actionable insight.
+            Keep it professional and concise.
+            """
+            ai_analysis = model.generate_content(analysis_prompt).text
 
-        # --- 4. The Dashboard Layout (The "Report View") ---
+        # --- 5. DASHBOARD LAYOUT ---
+        st.title(f"{stock_info.get('longName', ticker)} ({ticker})")
         
-        st.title(f"📊 {ticker} Executive Dashboard")
-        st.markdown(narrative)
+        # Top KPI Row
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        last_close = df['Close'].iloc[-1]
+        prev_close = df['Close'].iloc[-2]
+        change_pct = ((last_close - prev_close) / prev_close) * 100
+        
+        kpi1.metric("Current Price", f"${last_close:.2f}", f"{change_pct:.2f}%")
+        kpi2.metric("High (Period)", f"${df['High'].max():.2f}")
+        kpi3.metric("Low (Period)", f"${df['Low'].min():.2f}")
+        kpi4.metric("Volume (Avg)", f"{df['Volume'].mean():,.0f}")
+
         st.divider()
 
-        # Row 1: KPI Cards
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric(label="Current Price", value=f"${current_price:.2f}", delta=f"{df['Change%'].iloc[-1]:.2f}%")
-        with col2:
-            st.metric(label="30-Day Return", value=f"{return_30d:.2f}%")
-        with col3:
-            st.metric(label="Anomaly Count", value=str(anomaly_count), delta_color="inverse")
-        with col4:
-            st.metric(label="Max High", value=f"${df['High'].max():.2f}")
+        # TABS for Advanced Views
+        tab1, tab2, tab3 = st.tabs(["📊 Technical Chart", "🤖 AI Insights", "🏢 Fundamentals"])
 
-        # Row 2: Main Price Chart with Anomalies
-        st.subheader("Price Trend & Anomaly Detection")
-        
-        fig_price = go.Figure()
-        
-        # Line Chart
-        fig_price.add_trace(go.Scatter(
-            x=df['Date'], y=df['Close'],
-            mode='lines',
-            name='Close Price',
-            line=dict(color='#00B3FF', width=3)
-        ))
-        
-        # Anomaly Dots
-        anomalies = df[df['IsAnomaly']]
-        fig_price.add_trace(go.Scatter(
-            x=anomalies['Date'], y=anomalies['Close'],
-            mode='markers',
-            name='Anomaly',
-            marker=dict(color='red', size=10, symbol='x')
-        ))
+        # TAB 1: Advanced Charting
+        with tab1:
+            # Create Subplots: Row 1 = Price, Row 2 = RSI
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                vertical_spacing=0.03, subplot_titles=(f'{ticker} Price Action', 'RSI Momentum'),
+                                row_width=[0.2, 0.7])
 
-        fig_price.update_layout(
-            template="plotly_dark",
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            height=400,
-            margin=dict(l=20, r=20, t=30, b=20)
-        )
-        st.plotly_chart(fig_price, use_container_width=True)
+            # 1. Candlestick
+            fig.add_trace(go.Candlestick(x=df['Date'],
+                            open=df['Open'], high=df['High'],
+                            low=df['Low'], close=df['Close'], name='OHLC'), row=1, col=1)
 
-        # Row 3: Volume & Volatility
-        col_left, col_right = st.columns(2)
-        
-        with col_left:
-            st.subheader("Trading Volume")
-            fig_vol = go.Figure(data=[go.Bar(
-                x=df['Date'], y=df['Volume'],
-                marker_color='#2E86C1'
-            )])
-            fig_vol.update_layout(
-                template="plotly_dark",
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(0,0,0,0)',
-                height=300,
-                margin=dict(l=20, r=20, t=30, b=20)
-            )
-            st.plotly_chart(fig_vol, use_container_width=True)
+            # 2. Overlays
+            if show_sma:
+                fig.add_trace(go.Scatter(x=df['Date'], y=df['SMA_20'], line=dict(color='orange', width=1), name='SMA 20'), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df['Date'], y=df['SMA_50'], line=dict(color='blue', width=1), name='SMA 50'), row=1, col=1)
             
-        with col_right:
-            st.subheader("Market Volatility (Risk)")
-            fig_risk = go.Figure(data=[go.Area(
-                x=df['Date'], y=df['Volatility'],
-                marker_color='#E74C3C',
-                opacity=0.5
-            )])
-            fig_risk.update_layout(
-                template="plotly_dark",
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(0,0,0,0)',
-                height=300,
-                margin=dict(l=20, r=20, t=30, b=20)
-            )
-            st.plotly_chart(fig_risk, use_container_width=True)
+            if show_bb:
+                fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Upper'], line=dict(color='gray', width=1, dash='dot'), name='BB Upper'), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Lower'], line=dict(color='gray', width=1, dash='dot'), fill='tonexty', fillcolor='rgba(128,128,128,0.1)', name='BB Lower'), row=1, col=1)
 
-        # Raw Data Section (Power BI "Data View")
-        with st.expander("🔎 View Raw Data"):
-            st.dataframe(df.style.highlight_max(axis=0))
+            # 3. RSI Subplot
+            fig.add_trace(go.Scatter(x=df['Date'], y=df['RSI'], line=dict(color='#9b59b6', width=2), name='RSI'), row=2, col=1)
+            # RSI Lines (70/30)
+            fig.add_shape(type="line", x0=df['Date'].iloc[0], x1=df['Date'].iloc[-1], y0=70, y1=70, line=dict(color="red", width=1, dash="dash"), row=2, col=1)
+            fig.add_shape(type="line", x0=df['Date'].iloc[0], x1=df['Date'].iloc[-1], y0=30, y1=30, line=dict(color="green", width=1, dash="dash"), row=2, col=1)
+
+            fig.update_layout(height=600, xaxis_rangeslider_visible=False, template="plotly_dark")
+            st.plotly_chart(fig, use_container_width=True)
+
+        # TAB 2: AI Narrative
+        with tab2:
+            st.markdown("### 🧠 AI Technical Analyst Report")
+            st.info(ai_analysis)
+            
+            st.markdown("### 📋 Recent Data (Last 5 Days)")
+            st.dataframe(df[['Date', 'Close', 'Volume', 'RSI', 'SMA_20']].tail(5).style.format({"Close": "${:.2f}", "RSI": "{:.1f}", "SMA_20": "${:.2f}"}))
+
+        # TAB 3: Fundamentals
+        with tab3:
+            c1, c2, c3 = st.columns(3)
+            info = stock_info
+            
+            with c1:
+                st.markdown("**Sector**")
+                st.write(info.get('sector', 'N/A'))
+                st.markdown("**Industry**")
+                st.write(info.get('industry', 'N/A'))
+            
+            with c2:
+                st.markdown("**Market Cap**")
+                st.write(f"${info.get('marketCap', 0):,.0f}")
+                st.markdown("**Beta (Volatility)**")
+                st.write(info.get('beta', 'N/A'))
+                
+            with c3:
+                st.markdown("**P/E Ratio**")
+                st.write(info.get('trailingPE', 'N/A'))
+                st.markdown("**52 Week High**")
+                st.write(f"${info.get('fiftyTwoWeekHigh', 0):.2f}")
 
     except Exception as e:
-        st.error(f"An error occurred: {str(e)}")
+        st.error(f"Error analyzing {ticker}: {str(e)}")
 
 else:
-    # Landing Page State
-    st.markdown("### ⬅️ Enter a stock ticker in the sidebar and click Generate.")
+    # Landing Page
+    st.markdown("## 👋 Welcome to ProTraders AI")
+    st.markdown("Use the sidebar to enter your API key and search for any asset.")
+    st.markdown("Features included in this build:")
+    st.markdown("- **Candlestick Charts** with SMA & Bollinger Bands")
+    st.markdown("- **RSI Momentum** Oscillator")
+    st.markdown("- **Generative AI** Technical Analysis")
